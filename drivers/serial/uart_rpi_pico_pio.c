@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+// NOTE: in dts tx_pins and rx_pins need to be the same for single wire
+
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/drivers/uart.h>
@@ -47,6 +49,7 @@ struct pio_uart_config {
 	const uint32_t tx_pin;
 	const uint32_t rx_pin;
 	uint32_t baudrate;
+	bool single_wire;
 #ifdef CONFIG_UART_INTERRUPT_DRIVEN
 	uint8_t *rx_dma_buf;
 #endif
@@ -57,7 +60,9 @@ struct pio_uart_data {
 	size_t rx_sm;
 #ifdef CONFIG_UART_INTERRUPT_DRIVEN
 	struct k_spinlock cb_lock;
+	struct k_spinlock state_lock;
 	uart_irq_callback_user_data_t cb;
+	atomic_t tx_active;
 	void *cb_data;
 	atomic_t rx_irq_enabled;
 	atomic_t tx_irq_enabled;
@@ -80,6 +85,15 @@ RPI_PICO_PIO_DEFINE_PROGRAM(uart_tx, 0, 3,
 		/* .wrap */
 );
 
+RPI_PICO_PIO_DEFINE_PROGRAM(uart_tx_single_wire, 0, 3,
+		/* .wrap_target */
+	0x9fa0, /*  0: pull   block           side 1 [7]  */
+	0xf727, /*  1: set    x, 7            side 0 [7]  */
+	0x6081, /*  2: out    pindirs, 1                  */
+	0x0642, /*  3: jmp    x--, 2                 [6]  */
+		/* .wrap */
+);
+
 RPI_PICO_PIO_DEFINE_PROGRAM(uart_rx, 1, 8,
 	0x20a0, /*  0: wait   1 pin, 0                    */
 		/*  .wrap_target */
@@ -94,41 +108,75 @@ RPI_PICO_PIO_DEFINE_PROGRAM(uart_rx, 1, 8,
 		/*  .wrap */
 );
 
-static int pio_uart_tx_init(PIO pio, uint32_t sm, uint32_t tx_pin, float div)
+static int pio_uart_tx_init(const struct pio_uart_config *config, uint32_t sm, uint32_t tx_pin, float div)
 {
 	uint32_t offset;
 	pio_sm_config sm_config;
 
-	if (!pio_can_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(uart_tx))) {
+	PIO pio = pio_rpi_pico_get_pio(config->piodev);
+
+	// override what is configured in dts, these change during mode switching (rx -> tx, tx ->rx)
+	if (config->single_wire) {
+		gpio_set_input_enabled(tx_pin, true);
+		gpio_set_input_hysteresis_enabled(tx_pin, true);
+		gpio_pull_up(tx_pin);
+		gpio_set_drive_strength(tx_pin, GPIO_DRIVE_STRENGTH_12MA);
+	}
+
+	pio_program_t* program;
+	uint32_t wrap_target;
+	uint32_t wrap;
+	if (config->single_wire) {
+		program = RPI_PICO_PIO_GET_PROGRAM(uart_tx_single_wire);
+		wrap_target = RPI_PICO_PIO_GET_WRAP_TARGET(uart_tx_single_wire);
+		wrap = RPI_PICO_PIO_GET_WRAP(uart_tx_single_wire);
+	} else {
+		program = RPI_PICO_PIO_GET_PROGRAM(uart_tx);
+		wrap_target = RPI_PICO_PIO_GET_WRAP_TARGET(uart_tx);
+		wrap = RPI_PICO_PIO_GET_WRAP(uart_tx);
+	}
+
+	if (!pio_can_add_program(pio, program)) {
 		return -EBUSY;
 	}
 
-	offset = pio_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(uart_tx));
+	offset = pio_add_program(pio, program);
 	sm_config = pio_get_default_sm_config();
 
-	sm_config_set_sideset(&sm_config, SIDESET_BIT_COUNT, true, false);
+	if (config->single_wire) {
+		sm_config_set_sideset(&sm_config, SIDESET_BIT_COUNT, true, true);
+	} else {
+		sm_config_set_sideset(&sm_config, SIDESET_BIT_COUNT, true, false);
+	}
 	sm_config_set_out_shift(&sm_config, true, false, 0);
 	sm_config_set_out_pins(&sm_config, tx_pin, 1);
 	sm_config_set_sideset_pins(&sm_config, tx_pin);
 	sm_config_set_fifo_join(&sm_config, PIO_FIFO_JOIN_TX);
 	sm_config_set_clkdiv(&sm_config, div);
 	sm_config_set_wrap(&sm_config,
-			   offset + RPI_PICO_PIO_GET_WRAP_TARGET(uart_tx),
-			   offset + RPI_PICO_PIO_GET_WRAP(uart_tx));
+			   offset + wrap_target,
+			   offset + wrap);
 
 	/* Use 64-bit mask to support RP235xB SoCs (i.e. chips with >32 GPIO). */
-	pio_sm_set_pins_with_mask64(pio, sm, BIT64(tx_pin), BIT64(tx_pin));
-	pio_sm_set_pindirs_with_mask64(pio, sm, BIT64(tx_pin), BIT64(tx_pin));
+	if (config->single_wire) {
+		pio_sm_set_pins_with_mask64(pio, sm, 0, BIT64(tx_pin));
+		pio_sm_set_consecutive_pindirs(pio, sm, tx_pin, 1U, true);
+	} else {
+		pio_sm_set_pins_with_mask64(pio, sm, BIT64(tx_pin), BIT64(tx_pin));
+		pio_sm_set_pindirs_with_mask64(pio, sm, BIT64(tx_pin), BIT64(tx_pin));
+	}
 	pio_sm_init(pio, sm, offset, &sm_config);
 	pio_sm_set_enabled(pio, sm, true);
 
 	return 0;
 }
 
-static int pio_uart_rx_init(PIO pio, uint32_t sm, uint32_t rx_pin, float div)
+static int pio_uart_rx_init(const struct pio_uart_config *config, uint32_t sm, uint32_t rx_pin, float div)
 {
 	pio_sm_config sm_config;
 	uint32_t offset;
+
+	PIO pio = pio_rpi_pico_get_pio(config->piodev);
 
 	if (!pio_can_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(uart_rx))) {
 		return -EBUSY;
@@ -137,7 +185,8 @@ static int pio_uart_rx_init(PIO pio, uint32_t sm, uint32_t rx_pin, float div)
 	offset = pio_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(uart_rx));
 	sm_config = pio_get_default_sm_config();
 
-	pio_sm_set_consecutive_pindirs(pio, sm, rx_pin, 1, false);
+	if (!config->single_wire)
+		pio_sm_set_consecutive_pindirs(pio, sm, rx_pin, 1, false);
 	sm_config_set_in_pins(&sm_config, rx_pin);
 	sm_config_set_jmp_pin(&sm_config, rx_pin);
 	sm_config_set_in_shift(&sm_config, true, false, 0);
@@ -152,6 +201,92 @@ static int pio_uart_rx_init(PIO pio, uint32_t sm, uint32_t rx_pin, float div)
 
 	return 0;
 }
+
+static void pio_uart_enter_rx_state_now(const struct pio_uart_config *config,
+					struct pio_uart_data *data)
+{
+	PIO pio = pio_rpi_pico_get_pio(config->piodev);
+	const uint32_t tx_pin = config->tx_pin;
+
+	if (!config->single_wire) {
+		return;
+	}
+
+	/*
+	 * Stop TX before changing the pin direction/drive strength.
+	 */
+	pio_sm_set_enabled(pio, data->tx_sm, false);
+
+	/*
+	 * Weakly drive the line high while receiving. This augments the
+	 * pull-up but still allows the remote transmitter to pull it low.
+	 */
+	gpio_set_drive_strength(tx_pin, GPIO_DRIVE_STRENGTH_2MA);
+	pio_sm_set_pins_with_mask64(pio, data->tx_sm,
+				    BIT64(tx_pin), BIT64(tx_pin));
+	pio_sm_set_consecutive_pindirs(pio, data->tx_sm, tx_pin, 1U, false);
+	// pio_sm_set_pindirs_with_mask64(pio, data->tx_sm,
+	// 			       0,
+	// 			       BIT64(tx_pin));
+	/*
+	 * RX can now take ownership of the line.
+	 */
+	pio_sm_set_enabled(pio, data->rx_sm, true);
+
+
+
+}
+
+static void pio_uart_enter_rx_state(const struct pio_uart_config *config, struct pio_uart_data *data)
+{
+	PIO pio = pio_rpi_pico_get_pio(config->piodev);
+
+	if (!config->single_wire) {
+		return;
+	}
+
+	printk("changing to rx mode\n");
+
+	/*
+	 * The PIO TX FIFO can become empty before the final byte has
+	 * finished shifting out. TXSTALL is the important indication:
+	 * it means the SM attempted a PULL with an empty FIFO, i.e. the
+	 * final frame has completed.
+	 */
+	while (!pio_sm_is_tx_fifo_empty(pio, data->tx_sm) ||
+	    !(pio->fdebug & BIT(PIO_FDEBUG_TXSTALL_LSB + data->tx_sm))) {
+	}
+	pio_uart_enter_rx_state_now(config,data);
+	printk("changed to rx mode\n");
+}
+
+
+static void pio_uart_leave_rx_state(const struct pio_uart_config *config,
+				    struct pio_uart_data *data)
+{
+	PIO pio = pio_rpi_pico_get_pio(config->piodev);
+	const uint32_t tx_pin = config->tx_pin;
+
+	if (!config->single_wire) {
+		return;
+	}
+
+	printk("changing to tx mode\n");
+
+	/* In half-duplex, disable RX before driving the shared TX/RX pin. */
+	pio_sm_set_enabled(pio, data->rx_sm, false);
+
+	pio_sm_set_consecutive_pindirs(pio, data->tx_sm, tx_pin, 1u, true);
+	// pio_sm_set_pindirs_with_mask64(pio, data->tx_sm,
+	// 			       BIT64(tx_pin),
+	// 			       BIT64(tx_pin));
+	pio_sm_set_pins_with_mask64(pio, data->tx_sm, 0U, BIT64(tx_pin));
+	gpio_set_drive_strength(tx_pin, GPIO_DRIVE_STRENGTH_12MA);
+
+	pio_sm_restart(pio, data->tx_sm);
+	pio_sm_set_enabled(pio, data->tx_sm, true);
+}
+
 
 /*
  * The RX program shifts right, so the byte lands in the FIFO word's MSB.
@@ -170,11 +305,14 @@ static int pio_uart_poll_in(const struct device *dev, unsigned char *c)
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
 	struct pio_uart_data *data = dev->data;
 
+	printk("reading\n");
 	if (pio_sm_is_rx_fifo_empty(pio, data->rx_sm)) {
+		printk("rx fifo empty\n");
 		return -1;
 	}
 
 	*c = pio_uart_rx_fifo_get(pio, data->rx_sm);
+	printk("read %c\n", *c);
 	return 0;
 }
 
@@ -183,7 +321,11 @@ static void pio_uart_poll_out(const struct device *dev, unsigned char c)
 	const struct pio_uart_config *config = dev->config;
 	struct pio_uart_data *data = dev->data;
 
+	printk("Sending %c\n",c);
+
+	pio_uart_leave_rx_state(config, data);
 	pio_sm_put_blocking(pio_rpi_pico_get_pio(config->piodev), data->tx_sm, (uint32_t)c);
+	pio_uart_enter_rx_state(config, data);
 }
 
 #ifdef CONFIG_UART_INTERRUPT_DRIVEN
@@ -263,18 +405,35 @@ static int pio_uart_rx_ring_read(struct pio_uart_data *data, uint8_t *out, int m
 	return n;
 }
 
-static int pio_uart_fifo_fill(const struct device *dev, const uint8_t *tx_data, int len)
+static int pio_uart_fifo_fill(const struct device *dev,	const uint8_t *tx_data, int len)
 {
 	const struct pio_uart_config *config = dev->config;
 	struct pio_uart_data *data = dev->data;
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
 	int i;
 
-	for (i = 0; i < len && !pio_sm_is_tx_fifo_full(pio, data->tx_sm); i++) {
+	if (config->single_wire && len > 0) {
+		/*
+		 * Only switch from RX to TX when we actually have data.
+		 */
+		if (!atomic_get(&data->tx_active)) {
+			k_spinlock_key_t key = k_spin_lock(&data->state_lock);
+			pio_uart_leave_rx_state(config, data);
+			atomic_set(&data->tx_active, 1);
+			k_spin_unlock(&data->state_lock, key);
+		}
+	}
+
+	for (i = 0;
+	     i < len && !pio_sm_is_tx_fifo_full(pio, data->tx_sm);
+	     i++) {
 		pio->txf[data->tx_sm] = tx_data[i];
 	}
 
-	/* TXSTALL is sticky. Clearing it ties irq_tx_complete() to this fill. */
+	/*
+	 * Clear TXSTALL after adding data. The sticky flag is then set
+	 * again when the PIO finishes the final frame.
+	 */
 	pio->fdebug = BIT(PIO_FDEBUG_TXSTALL_LSB + data->tx_sm);
 
 	return i;
@@ -307,8 +466,10 @@ static int pio_uart_irq_tx_ready(const struct device *dev)
 	struct pio_uart_data *data = dev->data;
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
 
-	return atomic_get(&data->tx_irq_enabled) && !pio_sm_is_tx_fifo_full(pio, data->tx_sm);
+	return atomic_get(&data->tx_irq_enabled) &&
+	       !pio_sm_is_tx_fifo_full(pio, data->tx_sm);
 }
+
 
 static int pio_uart_irq_tx_complete(const struct device *dev)
 {
@@ -317,11 +478,35 @@ static int pio_uart_irq_tx_complete(const struct device *dev)
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
 
 	/*
-	 * The last frame keeps shifting out of the OSR after the FIFO empties.
-	 * TXSTALL latches once the state machine has finished it.
+	 * FIFO empty alone is NOT sufficient: the final byte may still
+	 * be in the OSR and physically shifting onto the wire.
+	 *
+	 * TXSTALL indicates that the SM has completed the final frame.
 	 */
-	return pio_sm_is_tx_fifo_empty(pio, data->tx_sm) &&
-	      (pio->fdebug & BIT(PIO_FDEBUG_TXSTALL_LSB + data->tx_sm));
+
+	if (!config->single_wire) {
+		return pio_sm_is_tx_fifo_empty(pio, data->tx_sm) &&
+		       (pio->fdebug & BIT(PIO_FDEBUG_TXSTALL_LSB + data->tx_sm));
+	}
+
+	if (!atomic_get(&data->tx_active)) {
+		return 0;
+	}
+
+
+	if (pio_sm_is_tx_fifo_empty(pio, data->tx_sm) &&
+	    (pio->fdebug & BIT(PIO_FDEBUG_TXSTALL_LSB + data->tx_sm))) {
+		k_spinlock_key_t key = k_spin_lock(&data->state_lock);
+		pio_uart_enter_rx_state_now(config, data);
+		atomic_set(&data->tx_active, 0);
+
+		/* TXSTALL is sticky, so clear it for the next transmission. */
+		pio->fdebug = BIT(PIO_FDEBUG_TXSTALL_LSB + data->tx_sm);
+		k_spin_unlock(&data->state_lock, key);
+		return 1;
+	}
+
+	return 0;
 }
 
 static void pio_uart_irq_rx_enable(const struct device *dev)
@@ -432,12 +617,12 @@ static int pio_uart_init(const struct device *dev)
 	data->tx_sm = tx_sm;
 	data->rx_sm = rx_sm;
 
-	retval = pio_uart_tx_init(pio, tx_sm, config->tx_pin, sm_clock_div);
+	retval = pio_uart_tx_init(config, tx_sm, config->tx_pin, sm_clock_div);
 	if (retval < 0) {
 		return retval;
 	}
 
-	retval = pio_uart_rx_init(pio, rx_sm, config->rx_pin, sm_clock_div);
+	retval = pio_uart_rx_init(config, rx_sm, config->rx_pin, sm_clock_div);
 	if (retval < 0) {
 		return retval;
 	}
@@ -455,6 +640,18 @@ static int pio_uart_init(const struct device *dev)
 	if (retval < 0) {
 		return retval;
 	}
+
+	pio_uart_enter_rx_state(config, data);
+	if (config->single_wire)
+		printk("single wire mode\n");
+
+	if (config->single_wire) {
+		gpio_set_input_enabled(config->tx_pin, true);
+		gpio_set_input_hysteresis_enabled(config->tx_pin, true);
+		gpio_pull_up(config->tx_pin);
+		gpio_set_drive_strength(config->tx_pin, GPIO_DRIVE_STRENGTH_12MA);
+	}
+	printk("initialized\n");
 
 #ifdef CONFIG_UART_INTERRUPT_DRIVEN
 	pio_uart_start_poll_thread(dev);
@@ -487,13 +684,14 @@ static DEVICE_API(uart, pio_uart_driver_api) = {
 	IF_ENABLED(CONFIG_UART_INTERRUPT_DRIVEN,						\
 		(static uint8_t									\
 		 pio_uart##idx##_rx_dma_buf[CONFIG_UART_RPI_PICO_PIO_RX_RING_BUF_SIZE]		\
-			__aligned(CONFIG_UART_RPI_PICO_PIO_RX_RING_BUF_SIZE);))		\
+			__aligned(CONFIG_UART_RPI_PICO_PIO_RX_RING_BUF_SIZE);))			\
 	static const struct pio_uart_config pio_uart##idx##_config = {				\
 		.piodev = DEVICE_DT_GET(DT_INST_PARENT(idx)),					\
 		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(idx),					\
 		.tx_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, tx_pins, 0),	\
 		.rx_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, rx_pins, 0),	\
 		.baudrate = DT_INST_PROP(idx, current_speed),					\
+		.single_wire = DT_INST_PROP(idx, single_wire),					\
 		IF_ENABLED(CONFIG_UART_INTERRUPT_DRIVEN,					\
 			(.rx_dma_buf = pio_uart##idx##_rx_dma_buf,))				\
 	};											\
